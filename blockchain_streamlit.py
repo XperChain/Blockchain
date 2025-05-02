@@ -5,8 +5,6 @@ import time
 import json
 import secrets
 import pandas as pd
-import qrcode
-from pyzbar.pyzbar import decode
 from io import BytesIO
 from PIL import Image
 from datetime import datetime, timedelta, timezone
