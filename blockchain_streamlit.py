@@ -10,12 +10,10 @@ from pyzbar.pyzbar import decode
 from io import BytesIO
 from PIL import Image
 from datetime import datetime, timedelta, timezone
+import cv2
+import numpy as np
 
-# MongoDB 연결
-#MONGO_URL = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
 
-# [mongodb]
-# uri = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
 MONGO_URL = st.secrets["mongodb"]["uri"]
 
 client = MongoClient(MONGO_URL)
@@ -229,17 +227,20 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
     if st.session_state.get("qr_scan_requested", False):
         image_file = st.camera_input("📸 QR 코드를 카메라로 스캔하세요")
         if image_file:
-            image = Image.open(image_file)
-            image_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            result = decode(image_cv)
-            if result:
-                qr_data = result[0].data.decode("utf-8")
-                st.session_state["recipient_scanned"] = qr_data
+            image = Image.open(image_file).convert("RGB")
+            img_np = np.array(image)
+            qr_decoder = cv2.QRCodeDetector()
+            data, points, _ = qr_decoder.detectAndDecode(img_np)
+
+            if data:
+                st.session_state["recipient_scanned"] = data
                 st.session_state["qr_scan_requested"] = False
                 st.success("✅ QR 코드 인식 성공!")
                 st.rerun()
             else:
                 st.error("❌ QR 코드 인식에 실패했습니다.")
+            
+   
 
     # 이체 금액 입력
     amount = st.number_input("💸 이체 금액", min_value=0.0, key="amount_input")

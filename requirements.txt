@@ -2,6 +2,5 @@ streamlit
 pymongo
 pillow
 opencv-python
-pyzbar
 pandas
-qrcode
+numpy
