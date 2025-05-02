@@ -12,8 +12,7 @@ import cv2
 import numpy as np
 
 
-#MONGO_URL = st.secrets["mongodb"]["uri"]
-MONGO_URL = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
+MONGO_URL = st.secrets["mongodb"]["uri"]
 
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
