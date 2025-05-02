@@ -10,7 +10,7 @@ from PIL import Image
 from datetime import datetime, timedelta, timezone
 import cv2
 import numpy as np
-
+import qrcode
 
 MONGO_URL = st.secrets["mongodb"]["uri"]
 
