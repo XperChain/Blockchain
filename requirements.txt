@@ -1,5 +1,5 @@
 streamlit
-pymongo
+pymongo[srv]
 pillow
 opencv-python-headless
 pandas
