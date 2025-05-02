@@ -12,8 +12,13 @@ import cv2
 import numpy as np
 import qrcode
 
-MONGO_URL = st.secrets["mongodb"]["uri"]
+# 설정값
+air_drop_interval_in_hour = 24
+air_drop_amount = 100
+KST = timezone(timedelta(hours=9))  # 한국 시간대 설정
+block_time_in_min = 1
 
+MONGO_URL = st.secrets["mongodb"]["uri"]
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
 blocks = db["blocks"]
@@ -75,6 +80,62 @@ def get_last_reward_time(public_key):
                 return datetime.fromtimestamp(t["timestamp"])
     return None
 
+def verify_signature(tx):
+    tx_copy = tx.copy()
+    signature = tx_copy.pop("signature")
+    sender = tx_copy["sender"]
+
+    # 실제로는 sender → private_key 매핑을 못 하기 때문에
+    # SYSTEM 또는 디버깅 상황에서는 서명 검증 스킵 가능
+    sender_user = users.find_one({"public_key": sender})
+    if not sender_user:
+        return False
+
+    private_key = sender_user["private_key"]
+    tx_string = json.dumps(tx_copy, sort_keys=True)
+    expected_signature = hashlib.sha256((tx_string + private_key).encode()).hexdigest()
+    return signature == expected_signature
+
+def is_valid_system_reward(tx, amount, hour):
+    """SYSTEM 보상 트랜잭션이 유효한지 확인"""
+    if tx.get("sender") != "SYSTEM":
+        return False, "SYSTEM 트랜잭션이 아닙니다."
+
+    if tx.get("amount") != amount:
+        return False, "SYSTEM 보상의 금액이 아님."
+
+    recipient = tx.get("recipient")
+    # 최근 보상 확인
+    recent = blocks.find_one(
+        {
+            "transactions": {
+                "$elemMatch": {
+                    "sender": "SYSTEM",
+                    "recipient": recipient
+                }
+            }
+        },
+        sort=[("timestamp", -1)]
+    )
+
+    if recent:
+        for t in recent["transactions"]:
+            if t["sender"] == "SYSTEM" and t["recipient"] == recipient:
+                last_time = datetime.fromtimestamp(t["timestamp"])
+                if datetime.now() - last_time < timedelta(hours=hour):
+                    return False, "최근 24시간 내 보상을 받았습니다."
+
+    return True, None
+
+def is_block_creation_allowed(block_time):
+    last_block = blocks.find_one(sort=[("index", -1)])
+    if not last_block:
+        return True  # 블록이 없다면 생성 허용
+    last_time = datetime.fromtimestamp(last_block["timestamp"])
+    return datetime.now() - last_time >= timedelta(minutes=block_time)
+
+
+
 # 초기 상태
 if "logged_in_user" not in st.session_state:
     st.session_state["logged_in_user"] = None
@@ -131,12 +192,95 @@ if not st.session_state["logged_in_user"]:
 if not st.session_state["logged_in_user"]:
     st.stop()
 
+    
+def auto_generate_block_if_needed(display = False):
+    if is_block_creation_allowed(block_time = block_time_in_min):
+        tx_list_raw = list(tx_pool.find())
+        if not tx_list_raw:
+            if display:
+                st.warning("⛔ 트랜잭션이 없습니다.")
+        else:
+            last_block = blocks.find_one(sort=[("index", -1)])
+            prev_hash = last_block["hash"] if last_block else "0"
+
+            valid_txs = []
+            invalid_txs = []  # ❗ 제외된 트랜잭션 저장
+            temp_balances = {}
+
+            for tx in tx_list_raw:
+                tx.pop("_id", None)
+                sender = tx["sender"]
+                recipient = tx["recipient"]
+                amount = tx["amount"]
+
+                if sender == "SYSTEM":
+                    valid, reason = is_valid_system_reward(tx, amount = air_drop_amount, hour = air_drop_interval_in_hour)
+                    if not valid:
+                        invalid_txs.append(tx)
+                        if display:
+                            st.warning(f"❌ 제외됨 (SYSTEM): {reason}")
+                    else:
+                        valid_txs.append(tx)
+                        temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
+                    continue
+                elif verify_signature(tx):
+                    temp_balances[sender] = temp_balances.get(sender, get_balance(sender))
+                    if temp_balances[sender] >= amount:
+                        valid_txs.append(tx)
+                        temp_balances[sender] -= amount
+                        temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
+                    else:
+                        invalid_txs.append(tx)
+                        if display:
+                            st.warning(f"❌ 제외됨: `{sender[:10]}...` 잔고 부족 (보내려는 금액: {amount})")
+                else:
+                    invalid_txs.append(tx)
+                    if display:
+                        st.warning(f"❌ 제외됨: `{sender[:10]}...` 서명 검증 실패")
+
+            if not valid_txs:
+                if display:
+                    st.error("❌ 유효한 트랜잭션이 없습니다.")
+            else:
+                new_block = create_block(valid_txs, previous_hash=prev_hash)
+                blocks.insert_one(new_block)
+
+                # ✅ 유효한 트랜잭션 삭제
+                for tx in valid_txs:
+                    tx_pool.delete_one({
+                        "sender": tx["sender"],
+                        "recipient": tx["recipient"],
+                        "amount": tx["amount"],
+                        "timestamp": tx["timestamp"],
+                        "signature": tx["signature"]
+                    })
+
+                # ✅ 잔고 부족한 트랜잭션도 삭제
+                for tx in invalid_txs:
+                    tx_pool.delete_one({
+                        "sender": tx["sender"],
+                        "recipient": tx["recipient"],
+                        "amount": tx["amount"],
+                        "timestamp": tx["timestamp"],
+                        "signature": tx["signature"]
+                    })
+                    
+                if display:
+                    st.success(f"✅ 블록 #{new_block['index']} 생성 완료! 포함된 트랜잭션 수: {len(valid_txs)}")
+                
+                # 잔고 갱신                
+                st.session_state["balance"] = get_balance(public_key)  
+                st.rerun()
+    
+    
 # 사용자 세션 정보
 user = st.session_state["logged_in_user"]
 public_key = user["public_key"]
 private_key = user["private_key"]
 st.session_state["public_key_input"] = public_key
 st.session_state["private_key_input"] = private_key
+
+auto_generate_block_if_needed(display = False)
 
 with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
     st.markdown(f"🪪 사용자: `{user['username']}`")
@@ -179,8 +323,8 @@ with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
         now = datetime.now()
         if last_reward_time:
             elapsed = now - last_reward_time
-            if elapsed < timedelta(hours=24):
-                remaining = timedelta(hours=24) - elapsed
+            if elapsed < timedelta(hours=air_drop_interval_in_hour):
+                remaining = timedelta(hours=air_drop_interval_in_hour) - elapsed
                 st.info(f"⏳ 다음 Air drop 보상까지 남은 시간: {str(remaining).split('.')[0]}")
                 reward_eligible = False
 
@@ -189,7 +333,7 @@ with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
                 coinbase_tx = {
                     "sender": "SYSTEM",
                     "recipient": public_key,
-                    "amount": 100.0,
+                    "amount": air_drop_amount,
                     "timestamp": time.time(),
                     "signature": "coinbase"
                 }
@@ -199,6 +343,7 @@ with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
                 blocks.insert_one(new_block)
                 st.session_state["balance"] = get_balance(public_key)
                 st.success("🎉 100 코인이 지급되었습니다!")
+                st.rerun()
         else:
             st.button("🆕 Air drop 보상", disabled=True, key="airdrop_disabled_btn")
 
@@ -248,102 +393,31 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
             else:
                 st.error("❌ QR 코드 인식에 실패했습니다.")
 
-            
-   
-
     # 이체 금액 입력
     amount = st.number_input("💸 이체 금액", min_value=0.0, key="amount_input")
     
-    col1, col2 = st.columns([1, 2], gap="small")
-    with col1:
-        # 트랜잭션 전송 버튼
-        if st.button("➕ 트랜잭션 전송"):
-            recipient_value = st.session_state["recipient_input"]
-            amount_value = st.session_state["amount_input"]
+    # 트랜잭션 전송 버튼
+    if st.button("➕ 트랜잭션 전송"):
+        recipient_value = st.session_state["recipient_input"]
+        amount_value = st.session_state["amount_input"]
 
-            if recipient_value.strip() == "" or amount_value <= 0:
-                st.warning("모든 필드를 입력하세요.")
-            elif amount_value > st.session_state["balance"]:
-                st.error("❌ 잔고 부족")
-            else:
-                tx_data = {
-                    "sender": public_key,
-                    "recipient": recipient_value,
-                    "amount": amount_value,
-                    "timestamp": time.time()
-                }
-                tx_data["signature"] = sign_transaction(private_key, tx_data)
-                tx_pool.insert_one(tx_data)
-                st.success("✅ 트랜잭션이 추가되었습니다.")
+        if recipient_value.strip() == "" or amount_value <= 0:
+            st.warning("모든 필드를 입력하세요.")
+        elif amount_value > st.session_state["balance"]:
+            st.error("❌ 잔고 부족")
+        else:
+            tx_data = {
+                "sender": public_key,
+                "recipient": recipient_value,
+                "amount": amount_value,
+                "timestamp": time.time()
+            }
+            tx_data["signature"] = sign_transaction(private_key, tx_data)
+            tx_pool.insert_one(tx_data)
+            st.success("✅ 트랜잭션이 추가되었습니다.")
+            
+            auto_generate_block_if_needed(display = True)
 
-                # 세션 상태를 직접 초기화하지 않고 rerun으로 리셋 유도
-                st.rerun()
-    with col2:
-        if st.button("🧱 블록 생성"):
-            tx_list_raw = list(tx_pool.find())
-            if not tx_list_raw:
-                st.warning("⛔ 트랜잭션이 없습니다.")
-            else:
-                last_block = blocks.find_one(sort=[("index", -1)])
-                prev_hash = last_block["hash"] if last_block else "0"
-
-                valid_txs = []
-                invalid_txs = []  # ❗ 제외된 트랜잭션 저장
-                temp_balances = {}
-
-                for tx in tx_list_raw:
-                    tx.pop("_id", None)
-                    sender = tx["sender"]
-                    recipient = tx["recipient"]
-                    amount = tx["amount"]
-
-                    if sender == "SYSTEM":
-                        valid_txs.append(tx)
-                        temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
-                    else:
-                        temp_balances[sender] = temp_balances.get(sender, get_balance(sender))
-                        if temp_balances[sender] >= amount:
-                            valid_txs.append(tx)
-                            temp_balances[sender] -= amount
-                            temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
-                        else:
-                            invalid_txs.append(tx)  # ❗잔고 부족으로 제외
-                            st.warning(f"❌ 제외됨: `{sender[:10]}...` 잔고 부족 (보내려는 금액: {amount})")
-
-                if not valid_txs:
-                    st.error("❌ 유효한 트랜잭션이 없습니다.")
-                else:
-                    new_block = create_block(valid_txs, previous_hash=prev_hash)
-                    blocks.insert_one(new_block)
-
-                    # ✅ 유효한 트랜잭션 삭제
-                    for tx in valid_txs:
-                        tx_pool.delete_one({
-                            "sender": tx["sender"],
-                            "recipient": tx["recipient"],
-                            "amount": tx["amount"],
-                            "timestamp": tx["timestamp"],
-                            "signature": tx["signature"]
-                        })
-
-                    # ✅ 잔고 부족한 트랜잭션도 삭제
-                    for tx in invalid_txs:
-                        tx_pool.delete_one({
-                            "sender": tx["sender"],
-                            "recipient": tx["recipient"],
-                            "amount": tx["amount"],
-                            "timestamp": tx["timestamp"],
-                            "signature": tx["signature"]
-                        })
-
-                    st.success(f"✅ 블록 #{new_block['index']} 생성 완료! 포함된 트랜잭션 수: {len(valid_txs)}")
-
-                    # 잔고 갱신
-                    st.session_state["balance"] = get_balance(public_key)  
-
-                    st.rerun()
-
-KST = timezone(timedelta(hours=9))  # 한국 시간대 설정
 
 # 📥 트랜잭션 풀 보기
 with st.expander("📥 현재 트랜잭션 풀", expanded=True):
