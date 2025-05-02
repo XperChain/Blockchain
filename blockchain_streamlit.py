@@ -12,7 +12,12 @@ from PIL import Image
 from datetime import datetime, timedelta, timezone
 
 # MongoDB 연결
-MONGO_URL = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
+#MONGO_URL = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
+
+# [mongodb]
+# uri = "mongodb+srv://XperChain:XperChain2121@db.leubgkp.mongodb.net/blockchain_db?retryWrites=true&w=majority&appName=db"
+MONGO_URL = st.secrets["mongodb"]["uri"]
+
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
 blocks = db["blocks"]

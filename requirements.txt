@@ -1,0 +1,6 @@
+streamlit
+pymongo
+pillow
+opencv-python
+pyzbar
+pandas
