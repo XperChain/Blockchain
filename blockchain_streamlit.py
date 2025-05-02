@@ -160,7 +160,7 @@ with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
             qr_img = qrcode.make(st.session_state['public_key_input'])
             buf = BytesIO()
             qr_img.save(buf, format="PNG")
-            st.image(buf.getvalue(), width=80)
+            st.image(buf.getvalue(), width=300)
 
     # 잔고 표시
     st.success(f"💰 현재 잔고: {st.session_state['balance']:.2f} 코인")
@@ -213,7 +213,11 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
     col1, col2 = st.columns([4, 1], gap="small")
 
     with col1:
-        recipient = st.text_input("📨 받는 사람 공개키", value=st.session_state.get("recipient_scanned", ""), key="recipient_input")
+        recipient = st.text_input(
+            "📨 받는 사람 공개키",
+            value=st.session_state.get("recipient_scanned", ""),
+            key="recipient_input"
+        )
 
     with col2:
         st.write("")
@@ -221,8 +225,14 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
         if st.button("📷 QR 스캔", key="qr_scan_btn"):
             st.session_state["qr_scan_requested"] = True
 
-    # QR 스캔 후 카메라 표시
+    # QR 스캔 활성화 상태인 경우에만 표시
     if st.session_state.get("qr_scan_requested", False):
+        # 버튼이 눌리면 즉시 상태를 False로 하고 종료
+        if st.button("❌ 스캔 취소", key="cancel_qr_btn"):
+            st.session_state["qr_scan_requested"] = False
+            st.rerun()  # 즉시 리렌더링하여 카메라와 버튼 제거
+
+        # 카메라 표시
         image_file = st.camera_input("📸 QR 코드를 카메라로 스캔하세요")
         if image_file:
             image = Image.open(image_file).convert("RGB")
@@ -237,6 +247,7 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
                 st.rerun()
             else:
                 st.error("❌ QR 코드 인식에 실패했습니다.")
+
             
    
 
