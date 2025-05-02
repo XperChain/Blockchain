@@ -14,6 +14,8 @@ import numpy as np
 
 MONGO_URL = st.secrets["mongodb"]["uri"]
 
+st.write(f"MONGO_URL: {MONGO_URL}")
+
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
 blocks = db["blocks"]
