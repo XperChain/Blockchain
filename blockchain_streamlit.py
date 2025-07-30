@@ -21,7 +21,6 @@ KST = timezone(timedelta(hours=9))  # KST timezone
 
 # DB 설정
 MONGO_URL = st.secrets["mongodb"]["uri"]
-MONGO_URL = "mongodb://XperChain:XperChain2121@ac-ejhvamk-shard-00-00.leubgkp.mongodb.net:27017,ac-ejhvamk-shard-00-01.leubgkp.mongodb.net:27017,ac-ejhvamk-shard-00-02.leubgkp.mongodb.net:27017/blockchain_db?tls=true&replicaSet=atlas-q7ilyw-shard-0&authSource=admin&retryWrites=true&w=majority"
 
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
