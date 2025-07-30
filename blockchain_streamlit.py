@@ -31,10 +31,7 @@ users = db["users"]
 peers = db['peers']  # p2p network will be implemented
 
 # miner wallet
-#miner_wallet = st.secrets["miner"]["public_key"]
-#miner_key = st.secrets["miner"]["private_key"]
 miner_wallet = '38887c137a1dc54e0f083a98844c36d5f8ca7fd4e5c7ba603067a2fdc117209f003d156d462c59dacdce58c4451ccd6a5a2f2a962fdcfb93a015f09d0fbc9c2d'
-miner_key = 'a0410cfe5057443532e61a3b99d28853318a25ed2fd1b6d32b0e8abd94ce32f2'
 
 BLOCK_INTERVAL = 6
 
