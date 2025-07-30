@@ -1,9 +1,9 @@
 import streamlit as st
 from pymongo import MongoClient
-import hashlib
-import time
-import json
 import secrets
+
+import hashlib, json
+import time
 import pandas as pd
 from io import BytesIO
 from PIL import Image
@@ -11,134 +11,38 @@ from datetime import datetime, timedelta, timezone
 import cv2
 import numpy as np
 import qrcode
+import base64
+from ecdsa import SigningKey, SECP256k1
 
-# 설정값
-air_drop_interval_in_hour = 24
-air_drop_amount = 100
-KST = timezone(timedelta(hours=9))  # 한국 시간대 설정
-block_time_in_min = 1
+from blockchain import *
+import utils
 
+KST = timezone(timedelta(hours=9))  # KST timezone
+
+# DB 설정
 MONGO_URL = st.secrets["mongodb"]["uri"]
+MONGO_URL = "mongodb://XperChain:XperChain2121@ac-ejhvamk-shard-00-00.leubgkp.mongodb.net:27017,ac-ejhvamk-shard-00-01.leubgkp.mongodb.net:27017,ac-ejhvamk-shard-00-02.leubgkp.mongodb.net:27017/blockchain_db?tls=true&replicaSet=atlas-q7ilyw-shard-0&authSource=admin&retryWrites=true&w=majority"
+
 client = MongoClient(MONGO_URL)
 db = client["blockchain_db"]
 blocks = db["blocks"]
-tx_pool = db["transactions"]
+transactions = db["transactions"]
+transaction_pool = db["transaction_pool"]
 users = db["users"]
+peers = db['peers']  # p2p network will be implemented
 
-# 해시 함수
-def hash_block(block):
-    block_string = json.dumps(block, sort_keys=True).encode()
-    return hashlib.sha256(block_string).hexdigest()
+# miner wallet
+#miner_wallet = st.secrets["miner"]["public_key"]
+#miner_key = st.secrets["miner"]["private_key"]
+miner_wallet = '38887c137a1dc54e0f083a98844c36d5f8ca7fd4e5c7ba603067a2fdc117209f003d156d462c59dacdce58c4451ccd6a5a2f2a962fdcfb93a015f09d0fbc9c2d'
+miner_key = 'a0410cfe5057443532e61a3b99d28853318a25ed2fd1b6d32b0e8abd94ce32f2'
 
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def sign_transaction(private_key, tx_data):
-    tx_string = json.dumps(tx_data, sort_keys=True)
-    return hashlib.sha256((tx_string + private_key).encode()).hexdigest()
-
-def create_block(transactions, previous_hash="0"):
-    block = {
-        "index": blocks.count_documents({}) + 1,
-        "timestamp": time.time(),
-        "transactions": transactions,
-        "previous_hash": previous_hash
-    }
-    block["hash"] = hash_block(block)
-    return block
-
-def generate_wallet():
-    private_key = secrets.token_hex(16)
-    public_key = hashlib.sha256(private_key.encode()).hexdigest()
-    return public_key, private_key
-
-def get_balance(address):
-    balance = 0.0
-    for block in blocks.find():
-        for tx in block["transactions"]:
-            if tx["recipient"] == address:
-                balance += tx["amount"]
-            if tx["sender"] == address and tx["sender"] != "SYSTEM":
-                balance -= tx["amount"]
-    return balance
-
-def get_last_reward_time(public_key):
-    tx = db["blocks"].find_one(
-        {
-            "transactions": {
-                "$elemMatch": {
-                    "sender": "SYSTEM",
-                    "recipient": public_key
-                }
-            }
-        },
-        sort=[("timestamp", -1)]
-    )
-    if tx:
-        for t in tx["transactions"]:
-            if t["sender"] == "SYSTEM" and t["recipient"] == public_key:
-                return datetime.fromtimestamp(t["timestamp"])
-    return None
-
-def verify_signature(tx):
-    tx_copy = tx.copy()
-    signature = tx_copy.pop("signature")
-    sender = tx_copy["sender"]
-
-    # 실제로는 sender → private_key 매핑을 못 하기 때문에
-    # SYSTEM 또는 디버깅 상황에서는 서명 검증 스킵 가능
-    sender_user = users.find_one({"public_key": sender})
-    if not sender_user:
-        return False
-
-    private_key = sender_user["private_key"]
-    tx_string = json.dumps(tx_copy, sort_keys=True)
-    expected_signature = hashlib.sha256((tx_string + private_key).encode()).hexdigest()
-    return signature == expected_signature
-
-def is_valid_system_reward(tx, amount, hour):
-    """SYSTEM 보상 트랜잭션이 유효한지 확인"""
-    if tx.get("sender") != "SYSTEM":
-        return False, "SYSTEM 트랜잭션이 아닙니다."
-
-    if tx.get("amount") != amount:
-        return False, "SYSTEM 보상의 금액이 아님."
-
-    recipient = tx.get("recipient")
-    # 최근 보상 확인
-    recent = blocks.find_one(
-        {
-            "transactions": {
-                "$elemMatch": {
-                    "sender": "SYSTEM",
-                    "recipient": recipient
-                }
-            }
-        },
-        sort=[("timestamp", -1)]
-    )
-
-    if recent:
-        for t in recent["transactions"]:
-            if t["sender"] == "SYSTEM" and t["recipient"] == recipient:
-                last_time = datetime.fromtimestamp(t["timestamp"])
-                if datetime.now() - last_time < timedelta(hours=hour):
-                    return False, "최근 24시간 내 보상을 받았습니다."
-
-    return True, None
-
-def is_block_creation_allowed(block_time):
-    last_block = blocks.find_one(sort=[("index", -1)])
-    if not last_block:
-        return True  # 블록이 없다면 생성 허용
-    last_time = datetime.fromtimestamp(last_block["timestamp"])
-    return datetime.now() - last_time >= timedelta(minutes=block_time)
-
-
+BLOCK_INTERVAL = 6
 
 # 초기 상태
 if "logged_in_user" not in st.session_state:
     st.session_state["logged_in_user"] = None
+
 if "balance" not in st.session_state:
     st.session_state["balance"] = 0.0
 
@@ -159,193 +63,111 @@ if not st.session_state["logged_in_user"]:
             st.session_state["password"] = ""
 
         # 입력 필드 with 세션 상태 연결
-        username = st.text_input("👤 사용자명", key="username")
+        username = st.text_input("👤 사용자", key="username")
         password = st.text_input("🔑 비밀번호", type="password", key="password")
 
         if auth_mode == "회원가입":
+            private_key_input = st.text_input("🔐 지갑 개인키(미입력 시 자동 생성)", key="private_key_input")
+
             if st.button("✅ 회원가입"):
                 if username == "" or password == "":
                     st.warning("모든 필드를 입력하세요.")
+                elif len(username) < 5:
+                    st.warning("사용자 명칭은 최소 5자리 이상이어야 합니다.")
+                elif len(password) < 8:
+                    st.warning("비밀번호는 최소 8자리 이상이어야 합니다.")
                 elif users.find_one({"username": username}):
                     st.error("이미 존재하는 사용자입니다.")
                 else:
-                    pub, priv = generate_wallet()
+                    # 개인키 수동 입력 여부 확인
+                    if private_key_input.strip():
+                        try:
+                            sk = SigningKey.from_string(bytes.fromhex(private_key_input), curve=SECP256k1)
+                            pub = sk.get_verifying_key().to_string().hex()
+                            priv = private_key_input
+                        except Exception as e:
+                            st.error(f"❌ 개인키 형식 오류: {e}")
+                            st.stop()
+                    else:
+                        # 자동 생성
+                        pub, priv = generate_wallet()
+
                     users.insert_one({
                         "username": username,
-                        "password_hash": hash_password(password),
+                        "password_hash": utils.hash_password(password),
                         "public_key": pub,
                         "private_key": priv
-                    })
-                    st.success("🎉 회원가입 성공! 이제 로그인 해보세요.")
+                    })                      
+                    st.success("🎉 회원가입 성공! 이제 로그인 해보세요.")                  
 
         elif auth_mode == "로그인":
             if st.button("🔓 로그인"):
                 user = users.find_one({"username": username})
-                if not user or user["password_hash"] != hash_password(password):
-                    st.error("❌ 사용자명 또는 비밀번호가 틀렸습니다.")
-                else:
+                if not user or user["password_hash"] != utils.hash_password(password):
+                    st.error("❌ 사용자 또는 비밀번호가 틀렸습니다.")
+                else:                                                          
+                    
                     st.session_state["logged_in_user"] = user
-                    st.session_state["balance"] = get_balance(user["public_key"])
-                    st.success(f"환영합니다, {username}님!")
+                    st.session_state["balance"] = get_balance(user["public_key"], blocks)
+                    st.success(f"환영합니다, {username}님!")                    
                     st.rerun()
 
 if not st.session_state["logged_in_user"]:
     st.stop()
-
-    
-def auto_generate_block_if_needed(display = False):
-    if is_block_creation_allowed(block_time = block_time_in_min):
-        tx_list_raw = list(tx_pool.find())
-        if not tx_list_raw:
-            if display:
-                st.warning("⛔ 트랜잭션이 없습니다.")
-        else:
-            last_block = blocks.find_one(sort=[("index", -1)])
-            prev_hash = last_block["hash"] if last_block else "0"
-
-            valid_txs = []
-            invalid_txs = []  # ❗ 제외된 트랜잭션 저장
-            temp_balances = {}
-
-            for tx in tx_list_raw:
-                tx.pop("_id", None)
-                sender = tx["sender"]
-                recipient = tx["recipient"]
-                amount = tx["amount"]
-
-                if sender == "SYSTEM":
-                    valid, reason = is_valid_system_reward(tx, amount = air_drop_amount, hour = air_drop_interval_in_hour)
-                    if not valid:
-                        invalid_txs.append(tx)
-                        if display:
-                            st.warning(f"❌ 제외됨 (SYSTEM): {reason}")
-                    else:
-                        valid_txs.append(tx)
-                        temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
-                    continue
-                elif verify_signature(tx):
-                    temp_balances[sender] = temp_balances.get(sender, get_balance(sender))
-                    if temp_balances[sender] >= amount:
-                        valid_txs.append(tx)
-                        temp_balances[sender] -= amount
-                        temp_balances[recipient] = temp_balances.get(recipient, get_balance(recipient)) + amount
-                    else:
-                        invalid_txs.append(tx)
-                        if display:
-                            st.warning(f"❌ 제외됨: `{sender[:10]}...` 잔고 부족 (보내려는 금액: {amount})")
-                else:
-                    invalid_txs.append(tx)
-                    if display:
-                        st.warning(f"❌ 제외됨: `{sender[:10]}...` 서명 검증 실패")
-
-            if not valid_txs:
-                if display:
-                    st.error("❌ 유효한 트랜잭션이 없습니다.")
-            else:
-                new_block = create_block(valid_txs, previous_hash=prev_hash)
-                blocks.insert_one(new_block)
-
-                # ✅ 유효한 트랜잭션 삭제
-                for tx in valid_txs:
-                    tx_pool.delete_one({
-                        "sender": tx["sender"],
-                        "recipient": tx["recipient"],
-                        "amount": tx["amount"],
-                        "timestamp": tx["timestamp"],
-                        "signature": tx["signature"]
-                    })
-
-                # ✅ 잔고 부족한 트랜잭션도 삭제
-                for tx in invalid_txs:
-                    tx_pool.delete_one({
-                        "sender": tx["sender"],
-                        "recipient": tx["recipient"],
-                        "amount": tx["amount"],
-                        "timestamp": tx["timestamp"],
-                        "signature": tx["signature"]
-                    })
-                    
-                if display:
-                    st.success(f"✅ 블록 #{new_block['index']} 생성 완료! 포함된 트랜잭션 수: {len(valid_txs)}")
-                
-                # 잔고 갱신                
-                st.session_state["balance"] = get_balance(public_key)  
-                st.rerun()
-    
     
 # 사용자 세션 정보
 user = st.session_state["logged_in_user"]
 public_key = user["public_key"]
 private_key = user["private_key"]
-st.session_state["public_key_input"] = public_key
-st.session_state["private_key_input"] = private_key
 
-auto_generate_block_if_needed(display = False)
-
+# col_spacer, col_button = st.columns([8, 2])
+# with col_button:
+#     if st.button("🔄 새로 고침"):
+#         st.session_state["clear_inputs"] = True
+#         st.session_state["balance"] = get_balance(public_key, blocks)            
+#         st.rerun()
+    
 with st.expander("📂 내 지갑 정보", expanded=True):  # 기본 펼쳐짐
-    st.markdown(f"🪪 사용자: `{user['username']}`")
-
+    st.markdown(f"👤 사용자: `{user['username']}`")
+    
+    
     # QR 생성 상태 관리
     if "qr_generated" not in st.session_state:
         st.session_state["qr_generated"] = False
 
-    col1, col2 = st.columns([4, 1], gap="small")
+    col1, col2 = st.columns([3, 1], gap="small")
 
     with col1:
-        st.success(f"지갑 주소: {st.session_state['public_key_input']}")
+        st.success(f"🪪 지갑 주소 `{public_key}`")
 
     with col2:
         if not st.session_state["qr_generated"]:
-            if st.button("📤 QR 생성", key="generate_qr_btn"):
+            if st.button("QR 보기", key="generate_qr_btn"):
                 st.session_state["qr_generated"] = True
                 st.rerun()
 
         if st.session_state["qr_generated"]:
-            qr_img = qrcode.make(st.session_state['public_key_input'])
+            qr_img = qrcode.make(public_key)
             buf = BytesIO()
             qr_img.save(buf, format="PNG")
             st.image(buf.getvalue(), width=300)
-
+    
     # 잔고 표시
-    st.success(f"💰 현재 잔고: {st.session_state['balance']:.2f} 코인")
-
-    # 로그아웃 및 Air drop 버튼
-    col1, col2 = st.columns([1, 2], gap="small")
-
+    # 잔고 표시 및 새로고침 버튼
+    col1, col2 = st.columns([3, 1], gap="small")
     with col1:
-        if st.button("🚪 로그아웃", key="logout_btn"):
-            st.session_state["logged_in_user"] = None
-            st.rerun()
-
+        st.success(f"💰 잔고 `{st.session_state['balance']:.2f} XPER`")       
     with col2:
-        reward_eligible = True
-        last_reward_time = get_last_reward_time(public_key)
-        now = datetime.now()
-        if last_reward_time:
-            elapsed = now - last_reward_time
-            if elapsed < timedelta(hours=air_drop_interval_in_hour):
-                remaining = timedelta(hours=air_drop_interval_in_hour) - elapsed
-                st.info(f"⏳ 다음 Air drop 보상까지 남은 시간: {str(remaining).split('.')[0]}")
-                reward_eligible = False
-
-        if reward_eligible:
-            if st.button("🆕 Air drop 보상", key="airdrop_btn"):
-                coinbase_tx = {
-                    "sender": "SYSTEM",
-                    "recipient": public_key,
-                    "amount": air_drop_amount,
-                    "timestamp": time.time(),
-                    "signature": "coinbase"
-                }
-                last_block = blocks.find_one(sort=[("index", -1)])
-                prev_hash = last_block["hash"] if last_block else "0"
-                new_block = create_block([coinbase_tx], previous_hash=prev_hash)
-                blocks.insert_one(new_block)
-                st.session_state["balance"] = get_balance(public_key)
-                st.success("🎉 100 코인이 지급되었습니다!")
-                st.rerun()
-        else:
-            st.button("🆕 Air drop 보상", disabled=True, key="airdrop_disabled_btn")
+        if st.button("🔄 잔고", key="refresh_balance"):
+            st.session_state["balance"] = get_balance(public_key, blocks)   
+            
+    #st.success(f"💰 잔고 `{st.session_state['balance']:.2f} XPER`")
+    
+    if st.button("🔒 로그아웃", key="logout_btn"):
+        st.session_state["logged_in_user"] = None
+        st.rerun()
+    
+                            
 
 # 트랜잭션
 # QR 스캔 상태 초기화
@@ -354,37 +176,42 @@ if "qr_scan_requested" not in st.session_state:
 if "recipient_scanned" not in st.session_state:
     st.session_state["recipient_scanned"] = ""
 
-with st.expander("📤 트랜잭션 전송", expanded=True):
-    col1, col2 = st.columns([4, 1], gap="small")
+    
+# 초기화용 플래그
+if "clear_inputs" not in st.session_state:
+    st.session_state["clear_inputs"] = False
 
+recipient_value = "" if st.session_state.clear_inputs else st.session_state.get("recipient_input", "")
+amount_value = 0.0 if st.session_state.clear_inputs else st.session_state.get("amount_input", 0.0)
+
+with st.expander("📤 이체", expanded=True):
+    col1, col2 = st.columns([4, 1], gap="small")    
     with col1:
-        recipient = st.text_input(
-            "📨 받는 사람 공개키",
-            value=st.session_state.get("recipient_scanned", ""),
-            key="recipient_input"
-        )
-
+        # 입력 필드    
+        if st.session_state.get("clear_inputs", False):
+            st.session_state["recipient_input"] = ""  # ✅ 입력창 초기화
+            st.session_state["clear_inputs"] = False
+            
+        recipient = st.text_input("📨 받는 지갑 주소", value=recipient_value, key="recipient_input")
+        
+        
     with col2:
         st.write("")
         st.write("")
         if st.button("📷 QR 스캔", key="qr_scan_btn"):
             st.session_state["qr_scan_requested"] = True
 
-    # QR 스캔 활성화 상태인 경우에만 표시
+    # QR 스캔
     if st.session_state.get("qr_scan_requested", False):
-        # 버튼이 눌리면 즉시 상태를 False로 하고 종료
         if st.button("❌ 스캔 취소", key="cancel_qr_btn"):
             st.session_state["qr_scan_requested"] = False
-            st.rerun()  # 즉시 리렌더링하여 카메라와 버튼 제거
-
-        # 카메라 표시
+            st.rerun()
         image_file = st.camera_input("📸 QR 코드를 카메라로 스캔하세요")
         if image_file:
             image = Image.open(image_file).convert("RGB")
             img_np = np.array(image)
             qr_decoder = cv2.QRCodeDetector()
             data, points, _ = qr_decoder.detectAndDecode(img_np)
-
             if data:
                 st.session_state["recipient_scanned"] = data
                 st.session_state["qr_scan_requested"] = False
@@ -392,100 +219,85 @@ with st.expander("📤 트랜잭션 전송", expanded=True):
                 st.rerun()
             else:
                 st.error("❌ QR 코드 인식에 실패했습니다.")
-
-    # 이체 금액 입력
-    amount = st.number_input("💸 이체 금액", min_value=0.0, key="amount_input")
+    amount = st.number_input("💸 금액", min_value=0.0, value=amount_value, key="amount_input")  
     
-    # 트랜잭션 전송 버튼
-    if st.button("➕ 트랜잭션 전송"):
-        recipient_value = st.session_state["recipient_input"]
-        amount_value = st.session_state["amount_input"]
-
-        if recipient_value.strip() == "" or amount_value <= 0:
-            st.warning("모든 필드를 입력하세요.")
-        elif amount_value > st.session_state["balance"]:
-            st.error("❌ 잔고 부족")
-        else:
+    st.info(f"💰 수수료: `{transaction_fee:.2f} XPER`")        
+    if st.button("➕ 이체하기"):
+        recipient_value = st.session_state.get("recipient_input", "")
+        amount_value = st.session_state.get("amount_input", 0.0)
+        if recipient_value.strip() == "":
+            st.warning("받는 지갑의 주소를 입력하세요.")
+        elif amount_value <= 0:
+            st.warning("이체 금액을 입력하세요.")
+        elif amount_value + transaction_fee > st.session_state["balance"]:
+            st.error("❌ 잔고 부족(수수료 포함)")
+        else:            
             tx_data = {
                 "sender": public_key,
                 "recipient": recipient_value,
                 "amount": amount_value,
+                "fee": transaction_fee,
                 "timestamp": time.time()
             }
             tx_data["signature"] = sign_transaction(private_key, tx_data)
-            tx_pool.insert_one(tx_data)
-            st.success("✅ 트랜잭션이 추가되었습니다.")
-            
-            auto_generate_block_if_needed(display = True)
+            transaction_pool.insert_one(tx_data)                            
+            st.success("✅ 이체 트랜잭션이 처리중입니다...")     
+                        
+            # 입력값 초기화용 플래그 활성화         
+            time.sleep(BLOCK_INTERVAL)  # 일정 시간 대기 (주의: UI 멈춤)
+            st.session_state["clear_inputs"] = True
+            st.session_state["balance"] = get_balance(public_key, blocks)            
+            st.rerun()                        
 
-
-# 📥 트랜잭션 풀 보기
-with st.expander("📥 현재 트랜잭션 풀", expanded=True):
-    txs = list(tx_pool.find())
+with st.expander("📥 이체 내역", expanded=True):
+    # 내 이체 내역만 조회 (sender 또는 recipient가 public_key)
+    txs = list(transactions.find({
+        "$or": [
+            {"sender": public_key},
+            {"recipient": public_key}
+        ]
+    }).sort("timestamp", -1))
 
     if txs:
         table_data = []
         for tx in txs:
+            sender = tx.get("sender", "")
+            recipient = tx.get("recipient", "")
+            amount = tx.get("amount", 0.0)
+            fee = tx.get("fee", 0.0)
+            total = amount + fee
+            time_str = datetime.fromtimestamp(tx["timestamp"], tz=KST).strftime('%Y-%m-%d %H:%M:%S')
+
+            # 입출금 방향 계산
+            if sender == public_key:
+                sign = "-"
+                direction = "출금"
+            elif recipient == public_key:
+                sign = "+"
+                direction = "입금"
+            else:
+                sign = ""
+                direction = "기타"
+
             table_data.append({
-                "보낸 사람": tx["sender"][:5] + "..." if tx.get("sender") else "",
-                "받는 사람": tx["recipient"][:5] + "..." if tx.get("recipient") else "",
-                "금액": tx.get("amount", 0),
-                "서명": tx["signature"][:5] + "..." if tx.get("signature") else "",
-                "시간": datetime.fromtimestamp(tx["timestamp"], tz=KST).strftime('%Y-%m-%d %H:%M:%S')
+                "보낸 사람": sender[:5] + "...",
+                "받는 사람": recipient[:5] + "...",
+                "금액": f"{sign}{amount:.2f}" if sign else f"{amount:.2f}",
+                "수수료": f"{sign}{fee:.2f}" if sign else f"{fee:.2f}",
+                "시간": time_str,
+                "구분": direction
             })
 
         df = pd.DataFrame(table_data)
-        st.dataframe(df, use_container_width=True)
+
+        def highlight_signed(val):
+            if isinstance(val, str) and val.startswith('+'):
+                return 'color: green; font-weight: bold'
+            elif isinstance(val, str) and val.startswith('-'):
+                return 'color: red; font-weight: bold'
+            return ''
+
+        styled_df = df.style.applymap(highlight_signed, subset=["금액", "수수료"])
+        st.dataframe(styled_df, use_container_width=True)
     else:
-        st.info("트랜잭션 풀이 비어 있습니다.")
-
-# ⛓️ 블록체인 보기
-with st.expander("⛓️ 블록체인 보기", expanded=False):
-    # 📌 최신 블록 번호 가져오기
-    latest_block = blocks.find_one(sort=[("index", -1)])
-    latest_index = latest_block["index"] if latest_block else 1
-
-    # 🔍 블록 번호 입력 (기본값 = 최신 블록 번호)
-    search_index = st.number_input("🔍 블록 번호로 검색", min_value=1, step=1, value=latest_index, format="%d")
-
-    block = blocks.find_one({"index": search_index})
-    if block:
-        # 📋 블록 정보 표
-        block_info = pd.DataFrame({
-            "속성": ["블록 번호", "해시", "이전 해시", "생성 시간", "트랜잭션 수"],
-            "값": [
-                block.get("index"),
-                block.get("hash", "")[:10] + "...",
-                block.get("previous_hash", "")[:10] + "...",
-                datetime.fromtimestamp(block.get("timestamp", time.time()), tz=KST).strftime('%Y-%m-%d %H:%M:%S'),
-                len(block.get("transactions", []))
-            ]
-        })
-
-        st.markdown("#### 📋 블록 정보")
-        st.dataframe(block_info, use_container_width=True)
-
-        # 📦 트랜잭션 목록
-        transactions = block.get("transactions", [])
-        if not transactions:
-            st.info("📭 이 블록에는 트랜잭션이 없습니다.")
-        else:
-            tx_table = []
-            for tx in transactions:
-                ts = tx.get("timestamp")
-                time_str = datetime.fromtimestamp(ts, tz=KST).strftime('%Y-%m-%d %H:%M:%S') if ts else "없음"
-
-                tx_table.append({
-                    "보낸 사람": tx.get("sender", "")[:5] + "...",
-                    "받는 사람": tx.get("recipient", "")[:5] + "...",
-                    "금액": tx.get("amount", 0),
-                    "서명": tx.get("signature", "")[:5] + "...",
-                    "시간": time_str
-                })
-
-            st.markdown("#### 📦 트랜잭션 목록")
-            st.dataframe(pd.DataFrame(tx_table), use_container_width=True)
-
-    else:
-        st.info("❗ 해당 번호의 블록을 찾을 수 없습니다.")
-
+        st.info("이체 내역이 없습니다.")
